@@ -1,62 +1,58 @@
-/* ai-worker.js — Motor de análisis de embeddings para ScriptLab
-   Modelo: Xenova/multilingual-e5-small (norma L2 habilitada → dot = coseno) */
-let extractor = null;
-let mode = 'basic';
+/* ai-worker.js — Motor de embeddings para ScriptLab v4.
+   Implementa §13.9 (ai-worker), §6.1, §7.2, §7.4, §7.5 del contrato.
+   Modelo: Xenova/multilingual-e5-small (ONNX cuantizado, ~118 MB).
+   Carga transformers.js vía import map (CDN esm.sh, decisión D6).
 
+   REGLA DE ORO: este worker computa, NO genera texto (§1.2). */
+
+// transformers.js se carga con import() DINÁMICO dentro de init(), no estático.
+// Razón: el import estático cross-origin en module Workers falla al cargar el
+// worker entero en Chromium (filename/lineno vacíos en onerror, sin mensaje).
+// El import dinámico es lazy y capturable. Patrón usado en v16 (software base).
+import { sanitizeText, dot, cosineSim } from './ai-shared.js';
+
+// transformers.js — patrón copiado EXACTO del software base (v18) que funciona hoy.
+// Lecciones (5 intentos):
+//   1. import map del documento padre → Chromium no lo hereda en module Workers.
+//   2. import estático desde URL → Chromium rechaza el worker al cargar.
+//   3. jsdelivr .mjs con path explícito → build Node (importa fs/path/url) → crash.
+//   4. esm.sh → polyfilla Node pero el CDN de HF bloquea CORS.
+//   5. ✅ Bare URL sin path (v3.7.2) + allowRemoteModels=true + device:'wasm' → FUNCIONA.
+// La bare URL deja que jsdelivr resuelva vía el campo "browser" del package.json
+// (build browser-ready con polyfills), no el .mjs crudo de Node.
+const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2';
+
+let extractor = null;
+
+/* ============================================================
+   loadExtractor — carga el modelo lazy al primer uso.
+   Patrón del software base v18 (comprobado funcionando).
+   ============================================================ */
 async function loadExtractor() {
   if (extractor) return extractor;
-  const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2');
+  const { pipeline, env } = await import(TRANSFORMERS_URL);
   env.useBrowserCache = true;
   env.allowRemoteModels = true;
   extractor = await pipeline('feature-extraction', 'Xenova/multilingual-e5-small', {
     device: 'wasm',
-    progress_callback: p => postMessage({
-      type: 'PROGRESS',
-      message: p.status === 'progress'
-        ? 'Descargando modelo: ' + Math.round(p.progress || 0) + '%'
-        : 'Preparando modelo local\u2026'
-    })
+    progress_callback: (p) => {
+      self.postMessage({
+        type: 'PROGRESS',
+        message: p.status === 'progress'
+          ? 'Descargando modelo: ' + Math.round(p.progress || 0) + '%'
+          : 'Preparando modelo local…'
+      });
+    }
   });
   return extractor;
 }
 
-/* ---------- sanitización de texto ---------- */
-function sanitizeText(text) {
-  if (!text || typeof text !== 'string') return ' ';
-  return text
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')   // control chars
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')                   // zero-width, BOM
-    .replace(/[\uD800-\uDFFF]/g, '')                         // surrogate pairs rotos
-    .replace(/[\uE000-\uF8FF]/g, '')                         // private use area
-    .replace(/[\uFFFE\uFFFF]/g, '')                          // non-characters
-    .replace(/[\u{10000}-\u{10FFFF}]/gu, c => {              // chars fuera BMP: mantener solo CJK comun + latin extendido
-      const cp = c.codePointAt(0);
-      if (cp >= 0x10000 && cp <= 0x2FFFF) return c;  // CJK, símbolos extendidos
-      return '';
-    })
-    .trim() || ' ';
-}
-
-/* ---------- utilidades vectoriales ---------- */
-function dot(a, b) {
-  if (!a || !b) return 0;
-  let s = 0;
-  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
-  return s;
-}
-
-function cosineSim(a, b) {
-  if (!a || !b) return 0;
-  const d = dot(a, b);
-  const na = Math.sqrt(a.reduce((s, x) => s + x * x, 0));
-  const nb = Math.sqrt(b.reduce((s, x) => s + x * x, 0));
-  return d / (na * nb || 1);
-}
-
-/* Genera embeddings para un array de {id, text}.
-   - Sanitiza cada texto para evitar token IDs fuera de rango.
-   - Trunca a 512 tokens (límite de e5-small).
-   - Si falla un batch, reintenta uno por uno para no perder todo. */
+/* ============================================================
+   embedTexts — embedde una lista de {id, text} con batching + retry.
+   Defensa contra el bug "Cannot convert undefined to a BigInt" de
+   transformers.js (tensor con valor undefined por texto problemático).
+   Patrón del software base v18.
+   ============================================================ */
 async function embedTexts(texts) {
   const model = await loadExtractor();
   const results = [];
@@ -65,13 +61,13 @@ async function embedTexts(texts) {
 
   for (let i = 0; i < texts.length; i += BATCH) {
     const batch = texts.slice(i, i + BATCH);
-    const safe = batch.map(t => sanitizeText(t.text));
+    const safe = batch.map(t => 'query: ' + sanitizeText(t.text));
     try {
       const output = await model(safe, OPTS);
       const vectors = output.tolist();
       batch.forEach((t, j) => results.push({ id: t.id, embedding: vectors[j] }));
     } catch (_) {
-      /* Batch falló — procesar uno por uno */
+      // Batch falló — procesar uno por uno para no perder todo.
       for (let j = 0; j < batch.length; j++) {
         try {
           const output = await model([safe[j]], OPTS);
@@ -86,365 +82,298 @@ async function embedTexts(texts) {
   return results;
 }
 
-/* ---------- handlers por tipo de mensaje ---------- */
-
-/* EMBED original — retrocompatibilidad con app.js */
-async function handleEmbed(data) {
-  const texts = [
-    { id: 'title', text: data.texts.find(t => t.id === 'title')?.text || '', role: 'title' },
-    { id: 'promise', text: data.texts.find(t => t.id === 'promise')?.text || '', role: 'promise' },
-    ...data.texts.filter(t => t.role === 'block')
-  ];
-  const hookItem = data.texts.find(t => t.id === 'hook');
-  if (hookItem) texts.push({ id: 'hook', text: hookItem.text, role: 'hook' });
-
-  const embedded = await embedTexts(texts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
-
-  const blocks = data.texts.filter(x => x.role === 'block');
-  const adj = [];
-  for (let i = 1; i < blocks.length; i++) {
-    adj.push(dot(map[blocks[i - 1].id], map[blocks[i].id]));
-  }
-  return {
-    type: 'EMBED_RESULT',
-    requestId: data.requestId,
-    cacheId: data.cacheId,
-    alignment: dot(map.hook, map.promise),
-    titleAlignment: dot(map.hook, map.title),
-    redundancy: adj.length ? Math.max(...adj) : 0,
-    confidence: 0.72
-  };
+/* ============================================================
+   embedAll — wrapper simple que devuelve solo los embeddings.
+   ============================================================ */
+async function embedAll(rawTexts) {
+  const wrapped = rawTexts.map((t, i) => ({ id: 't' + i, text: t }));
+  const embedded = await embedTexts(wrapped);
+  return embedded.map(e => e.embedding);
 }
 
-/* ACTUALIZACIÓN 1 — Resumen extractivo (oraciones clave) */
-async function handleExtractKeySentences(data) {
-  const { sentences, topN = 5 } = data;
-  const allTexts = [
-    { id: '__full__', text: data.fullText || '' },
-    ...sentences.map((s, i) => ({ id: 's' + i, text: s }))
-  ];
-  const embedded = await embedTexts(allTexts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
-  const fullEmb = map['__full__'];
+/* ============================================================
+   INIT — dispara la carga del modelo (lazy a través de loadExtractor).
+   ============================================================ */
+async function init(revision) {
+  await loadExtractor();
+  self.postMessage({ type: 'READY' });
+}
 
-  const scored = sentences.map((s, i) => ({
-    index: i,
-    text: s,
-    score: cosineSim(fullEmb, map['s' + i])
+/* ============================================================
+   EMBED (tier 1, push) — alineación hook↔promesa + baseline pairwise
+   Devuelve: { alignment, alignmentRaw, redundancy, baseline:{avgSim,maxSim,pairCount} }
+   ============================================================ */
+async function embed({ requestId, cacheId, texts }) {
+  // texts: [{id, text, role: 'title'|'promise'|'block'|'hook'}]
+  const rawTexts = texts.map(t => t.text);
+  const embs = await embedAll(rawTexts);
+  const embMap = {};
+  texts.forEach((t, i) => { embMap[t.id] = embs[i]; });
+
+  // --- Baseline pairwise sobre los bloques ---
+  const blockEntries = texts.filter(t => t.role === 'block');
+  const blockEmbs = blockEntries.map(b => embMap[b.id]);
+  let pairCount = 0;
+  let sumSim = 0;
+  let maxSim = 0;
+  for (let i = 0; i < blockEmbs.length; i++) {
+    for (let j = i + 1; j < blockEmbs.length; j++) {
+      const s = dot(blockEmbs[i], blockEmbs[j]); // L2-normalizados → dot = coseno
+      sumSim += s;
+      pairCount++;
+      if (s > maxSim) maxSim = s;
+    }
+  }
+  const avgSim = pairCount > 0 ? sumSim / pairCount : 0;
+
+  // --- Alineación hook↔promesa ---
+  const hookEmb = embMap['hook'];
+  const promiseEmb = embMap['promise'];
+  let alignmentRaw = 0;
+  if (hookEmb && promiseEmb) alignmentRaw = dot(hookEmb, promiseEmb);
+
+  // Normalización de alignment al baseline: "qué tan alineado es hook-promesa
+  // relativo a la distribución pairwise del guion". clamp [0,1].
+  // [Normalización INFERENCIAL — design choice, no validado externamente]
+  let alignment;
+  if (pairCount > 0 && maxSim > avgSim) {
+    alignment = clamp01((alignmentRaw - avgSim) / (maxSim - avgSim));
+  } else if (pairCount > 0) {
+    alignment = alignmentRaw > avgSim ? 1 : 0;
+  } else {
+    alignment = clamp01(alignmentRaw); // sin baseline, raw directo
+  }
+
+  // Redundancia: avgSim como fracción de maxSim ("qué tan uniforme es el
+  // espacio semántico del guion"). Mayor = más redundante.
+  // [Definición INFERENCIAL — proxy de redundancia para tier 1]
+  const redundancy = (pairCount > 0 && maxSim > 0) ? avgSim / maxSim : 0;
+
+  self.postMessage({
+    type: 'EMBED_RESULT',
+    requestId,
+    cacheId,
+    alignment,
+    alignmentRaw,
+    redundancy,
+    baseline: { avgSim, maxSim, pairCount }
+  });
+}
+
+/* ============================================================
+   EXTRACT_KEY_SENTENCES (tier 2) — oraciones más representativas
+   vs el centroide del guion. Top-N por similitud coseno.
+   ============================================================ */
+async function extractKeySentences({ requestId, sentences, fullText, topN }) {
+  if (sentences.length === 0) {
+    self.postMessage({ type: 'EXTRACT_RESULT', requestId, sentences: [] });
+    return;
+  }
+  const sentenceEmbs = await embedAll(sentences);
+  const [centroidEmb] = await embedAll([fullText]);
+  const scored = sentences.map((text, i) => ({
+    text,
+    score: dot(sentenceEmbs[i], centroidEmb) // L2-norm → dot = coseno
   }));
   scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, topN);
-  top.sort((a, b) => a.index - b.index); // restaurar orden original
-
-  return { type: 'EXTRACT_KEY_RESULT', requestId: data.requestId, sentences: top };
+  const top = scored.slice(0, Math.min(topN, scored.length));
+  self.postMessage({ type: 'EXTRACT_RESULT', requestId, sentences: top });
 }
 
-/* ACTUALIZACIÓN 2 — Redundancia global (detección de repetición semántica) */
-async function handleRedundancy(data) {
-  const { blocks, threshold = 0.85 } = data;
-  const texts = blocks.map((b, i) => ({ id: 'b' + i, text: b }));
-  const embedded = await embedTexts(texts);
-  const vecs = embedded.map(e => e.embedding);
+/* ============================================================
+   COMPUTE_REDUNDANCY (tier 2) — pairwise con separación de contrastes.
+   "Redundante" = mismo tema (alta sim) + mismo tono (Δvalencia baja).
+   "Contraste"   = mismo tema + tono opuesto (Δvalencia alta) → estructura válida.
+   ============================================================ */
+async function computeRedundancy({ requestId, blocks, blockIds, threshold, valenceMap }) {
+  const embs = await embedAll(blocks);
 
-  const n = vecs.length;
-  const matrix = [];
-  let totalSim = 0;
-  let pairs = 0;
-  const redundant = [];
+  const redundantPairs = [];
+  const contrastPairs = [];
+  let sumSim = 0, pairCount = 0, maxSim = 0;
 
-  for (let i = 0; i < n; i++) {
-    matrix[i] = [];
-    for (let j = i + 1; j < n; j++) {
-      const sim = dot(vecs[i], vecs[j]);
-      matrix[i][j] = sim;
-      totalSim += sim;
-      pairs++;
-      if (sim > threshold && i !== j) {
-        redundant.push({ i, j, similarity: sim, textA: blocks[i], textB: blocks[j] });
+  for (let i = 0; i < blocks.length; i++) {
+    for (let j = i + 1; j < blocks.length; j++) {
+      const sim = dot(embs[i], embs[j]);
+      sumSim += sim; pairCount++;
+      if (sim > maxSim) maxSim = sim;
+
+      if (sim >= threshold) {
+        const vi = valenceMap?.[blockIds[i]] ?? 0;
+        const vj = valenceMap?.[blockIds[j]] ?? 0;
+        const valenceDiff = Math.abs(vi - vj);
+        const pair = {
+          textA: blocks[i], textB: blocks[j],
+          similarity: sim, rawSimilarity: sim
+        };
+        // Umbral contraste: Δvalencia ≥ 0.50 = tono opuesto (§7.6.1 banda medio).
+        // [INFERIDO de VADER — cambio significativo de tono]
+        if (valenceDiff >= 0.50) {
+          contrastPairs.push({ ...pair, valenceDiff });
+        } else {
+          redundantPairs.push(pair);
+        }
       }
     }
   }
 
-  const globalIndex = pairs > 0 ? totalSim / pairs : 0;
-  const density = Math.max(0, Math.min(1, 1 - globalIndex));
+  const avgSim = pairCount > 0 ? sumSim / pairCount : 0;
+  const density = (pairCount > 0 && maxSim > 0) ? avgSim / maxSim : 0;
 
-  return {
+  self.postMessage({
     type: 'REDUNDANCY_RESULT',
-    requestId: data.requestId,
-    redundantPairs: redundant.sort((a, b) => b.similarity - a.similarity),
-    globalIndex,
+    requestId,
     density,
-    totalBlocks: n,
-    totalPairs: pairs,
-    redundantCount: redundant.length
-  };
+    redundantCount: redundantPairs.length,
+    contrastCount: contrastPairs.length,
+    redundantPairs,
+    contrastPairs,
+    baseline: { avgSim, maxSim }
+  });
 }
 
-/* ACTUALIZACIÓN 3 — Densidad temática por minuto */
-async function handleDensity(data) {
-  const { segments, fullText } = data;
-  const allTexts = [
-    { id: '__global__', text: fullText || segments.map(s => s.text).join(' ') },
-    ...segments.map((s, i) => ({ id: 'seg' + i, text: s.text }))
-  ];
-  const embedded = await embedTexts(allTexts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
-  const globalEmb = map['__global__'];
-
-  const n = segments.length;
-  const globalSims = [];
-  const transitionSims = [];
-
-  for (let i = 0; i < n; i++) {
-    const simGlobal = dot(map['seg' + i], globalEmb);
-    globalSims.push(simGlobal);
-    if (i > 0) {
-      transitionSims.push(dot(map['seg' + i - 1], map['seg' + i]));
-    }
+/* ============================================================
+   COMPUTE_DENSITY (tier 2) — temas/minuto.
+   Segmentos de 1 min (wpm palabras). Similitud de cada segmento
+   con el global. Detección de cambios temáticos entre segmentos consecutivos.
+   ============================================================ */
+async function computeDensity({ requestId, segments, fullText }) {
+  if (segments.length === 0) {
+    self.postMessage({ type: 'DENSITY_RESULT', requestId, topicsPerMinute: 0, density: 0, totalSegments: 0, avgGlobalSim: 0, segments: [], changes: [] });
+    return;
   }
+  const segEmbs = await embedAll(segments.map(s => s.text));
+  const [globalEmb] = await embedAll([fullText]);
+  const segScored = segments.map((s, i) => ({
+    label: s.label,
+    globalSim: dot(segEmbs[i], globalEmb)
+  }));
+  const avgGlobalSim = segScored.reduce((a, s) => a + s.globalSim, 0) / segScored.length;
 
-  const avgGlobalSim = globalSims.length ? globalSims.reduce((a, b) => a + b, 0) / globalSims.length : 0;
-  const avgTransition = transitionSims.length ? transitionSims.reduce((a, b) => a + b, 0) / transitionSims.length : 0;
-  const density = Math.max(0, 1 - avgGlobalSim);
-
-  /* Estimación de temas por minuto */
-  const estimatedMinutes = Math.max(1, n);
-  const topicsPerMinute = density * 2.5; // escala heurística
-
-  /* Identificar cambios temáticos */
-  const changes = [];
-  for (let i = 0; i < transitionSims.length; i++) {
-    if (transitionSims[i] < avgTransition - 0.1) {
-      changes.push({ afterSegment: i + 1, similarity: transitionSims[i] });
-    }
+  // Cambios temáticos: similitud entre segmentos consecutivos por debajo de
+  // la media de las transiciones menos una desviación estándar. Así el umbral
+  // se adapta al guion y no queda bloqueado por la similitud global.
+  const transitions = [];
+  for (let i = 1; i < segEmbs.length; i++) {
+    transitions.push({ afterSegment: i - 1, similarity: dot(segEmbs[i - 1], segEmbs[i]) });
   }
+  const transitionMean = transitions.length
+    ? transitions.reduce((sum, t) => sum + t.similarity, 0) / transitions.length
+    : avgGlobalSim;
+  const transitionVariance = transitions.length
+    ? transitions.reduce((sum, t) => sum + (t.similarity - transitionMean) ** 2, 0) / transitions.length
+    : 0;
+  const adaptiveThreshold = transitionMean - Math.sqrt(transitionVariance);
+  const changes = transitions.filter(t => t.similarity < adaptiveThreshold);
 
-  return {
+  // Un guion con contenido tiene al menos un tema. Antes se calculaban solo
+  // los cambios; por eso el resultado quedaba en 0 cuando no había un corte.
+  // Los segmentos son ventanas aproximadas de un minuto según splitIntoSegments.
+  const topicCount = changes.length + 1;
+  const topicsPerMinute = segments.length > 0 ? topicCount / segments.length : 0;
+  const density = avgGlobalSim;
+
+  self.postMessage({
     type: 'DENSITY_RESULT',
-    requestId: data.requestId,
-    globalSims,
-    transitionSims,
-    density,
-    avgGlobalSim,
-    avgTransition,
+    requestId,
     topicsPerMinute: Math.round(topicsPerMinute * 10) / 10,
-    segments: segments.map((s, i) => ({
-      index: i,
-      label: s.label || 'Segmento ' + (i + 1),
-      globalSim: globalSims[i]
-    })),
-    changes,
-    totalSegments: n
-  };
+    density,
+    totalSegments: segments.length,
+    avgGlobalSim,
+    adaptiveThreshold,
+    topicCount,
+    segments: segScored,
+    changes
+  });
 }
 
-/* ACTUALIZACIÓN 4 — Comparación A/B semántica */
-async function handleCompare(data) {
-  const { script1, script2, blocks1, blocks2 } = data;
-  const texts = [
-    { id: '__s1__', text: script1 },
-    { id: '__s2__', text: script2 }
-  ];
-  const embedded = await embedTexts(texts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
+/* ============================================================
+   DETECT_GAPS (tier 2) — cobertura semántica contra centroides.
+   Cada tema: centroide de sus oraciones ejemplo. Umbral adaptativo:
+   media−σ de la distribución de mejores matches. [Adaptativo, INFERIDO]
+   ============================================================ */
+async function detectGaps({ requestId, blocks, topics }) {
+  // topics: [{label, examples: string[]}] (los semánticos)
+  const blockEmbs = await embedAll(blocks);
 
-  const globalSim = dot(map['__s1__'], map['__s2__']);
-
-  /* Desglose por bloques (opcional) */
-  let blockBreakdown = null;
-  if (blocks1 && blocks2) {
-    const allBlocks = [
-      ...blocks1.map((b, i) => ({ id: 'a' + i, text: b, group: 1, index: i })),
-      ...blocks2.map((b, i) => ({ id: 'b' + i, text: b, group: 2, index: i }))
-    ];
-    const bEmb = await embedTexts(allBlocks);
-    const bMap = Object.fromEntries(bEmb.map(e => [e.id, e.embedding]));
-
-    const divergent = [];
-    for (let i = 0; i < blocks1.length; i++) {
-      let maxSim = 0;
-      for (let j = 0; j < blocks2.length; j++) {
-        const s = dot(bMap['a' + i], bMap['b' + j]);
-        if (s > maxSim) maxSim = s;
-      }
-      divergent.push({ blockIndex: i, text: blocks1[i], maxSimilarity: maxSim });
-    }
-    for (let j = 0; j < blocks2.length; j++) {
-      let maxSim = 0;
-      for (let i = 0; i < blocks1.length; i++) {
-        const s = dot(bMap['b' + j], bMap['a' + i]);
-        if (s > maxSim) maxSim = s;
-      }
-      divergent.push({ blockIndex: j, text: blocks2[j], maxSimilarity: maxSim, group: 2 });
-    }
-    divergent.sort((a, b) => a.maxSimilarity - b.maxSimilarity);
-    blockBreakdown = divergent.slice(0, 10);
+  // Centroides: promedio L2-normalizado de los embeddings de los ejemplos de cada tema.
+  const topicData = [];
+  for (const topic of topics) {
+    if (!topic.examples || topic.examples.length === 0) continue;
+    const exEmbs = await embedAll(topic.examples);
+    const dim = exEmbs[0].length;
+    const centroid = new Array(dim).fill(0);
+    for (const e of exEmbs) for (let d = 0; d < dim; d++) centroid[d] += e[d];
+    for (let d = 0; d < dim; d++) centroid[d] /= exEmbs.length;
+    // normalizar el centroide
+    const norm = Math.sqrt(centroid.reduce((s, x) => s + x * x, 0)) || 1;
+    const centroidNorm = centroid.map(x => x / norm);
+    topicData.push({ label: topic.label, centroid: centroidNorm });
   }
 
-  let interpretation = 'muy diferente';
-  if (globalSim > 0.9) interpretation = 'casi idéntico';
-  else if (globalSim > 0.75) interpretation = 'muy similar';
-  else if (globalSim > 0.5) interpretation = 'similar en temas principales';
-  else if (globalSim > 0.3) interpretation = 'parcialmente diferente';
-  else interpretation = 'muy diferente';
+  // Mejor match de cada tema contra los bloques
+  const matches = topicData.map(td => {
+    let best = 0, bestBlock = 0;
+    blockEmbs.forEach((be, i) => {
+      const s = dot(be, td.centroid);
+      if (s > best) { best = s; bestBlock = i; }
+    });
+    return { topic: td.label, maxSimilarity: best, bestBlock };
+  });
 
-  return {
-    type: 'COMPARE_RESULT',
-    requestId: data.requestId,
-    globalSimilarity: globalSim,
-    interpretation,
-    blockBreakdown
-  };
-}
+  // Umbral adaptativo: media − σ de las mejores similitudes.
+  const mean = matches.reduce((a, m) => a + m.maxSimilarity, 0) / (matches.length || 1);
+  const variance = matches.reduce((s, m) => s + (m.maxSimilarity - mean) ** 2, 0) / (matches.length || 1);
+  const std = Math.sqrt(variance);
+  const adaptiveThreshold = mean - std;
 
-/* ACTUALIZACIÓN 5 — Detección de huecos con temas predefinidos */
-async function handleGaps(data) {
-  const { blocks, topics } = data;
-  const blockTexts = blocks.map((b, i) => ({ id: 'b' + i, text: b }));
-  const topicTexts = topics.map((t, i) => ({ id: 't' + i, text: t.text }));
+  const gaps = matches.filter(m => m.maxSimilarity < adaptiveThreshold);
+  const covered = matches.filter(m => m.maxSimilarity >= adaptiveThreshold);
 
-  const allTexts = [...blockTexts, ...topicTexts];
-  const embedded = await embedTexts(allTexts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
-
-  const gaps = [];
-  const covered = [];
-  for (let i = 0; i < topics.length; i++) {
-    let maxSim = 0;
-    let bestBlock = -1;
-    for (let j = 0; j < blocks.length; j++) {
-      const s = dot(map['t' + i], map['b' + j]);
-      if (s > maxSim) { maxSim = s; bestBlock = j; }
-    }
-    const item = { topic: topics[i].label || topics[i].text, maxSimilarity: maxSim, bestBlock };
-    if (maxSim < (data.threshold || 0.55)) {
-      gaps.push(item);
-    } else {
-      covered.push(item);
-    }
-  }
-
-  return {
+  self.postMessage({
     type: 'GAPS_RESULT',
-    requestId: data.requestId,
+    requestId,
     gaps,
     covered,
-    totalTopics: topics.length,
-    gapCount: gaps.length
-  };
+    adaptiveThreshold,
+    baselineMean: mean,
+    baselineStd: std
+  });
 }
 
-/* ACTUALIZACIÓN 6-8 — EMBED_TEXTS genérico (para referentes) */
-async function handleEmbedTexts(data) {
-  const { texts } = data;
-  const embedded = await embedTexts(texts);
-  const map = Object.fromEntries(embedded.map(e => [e.id, e.embedding]));
-  return { type: 'EMBED_TEXTS_RESULT', requestId: data.requestId, embeddings: map };
-}
+/* ============================================================
+   Helpers
+   ============================================================ */
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
-/* ACTUALIZACIÓN 8 — Huecos comparando con referente */
-async function handleRefGaps(data) {
-  const { scriptBlocks, refBlocks, threshold = 0.5 } = data;
-  const sTexts = scriptBlocks.map((b, i) => ({ id: 's' + i, text: b }));
-  const rTexts = refBlocks.map((b, i) => ({ id: 'r' + i, text: b }));
-  const allTexts = [...sTexts, ...rTexts];
-
-  const embedded = await embedTexts(allTexts);
-  const sMap = Object.fromEntries(
-    embedded.filter(e => e.id.startsWith('s')).map(e => [e.id, e.embedding])
-  );
-  const rMap = Object.fromEntries(
-    embedded.filter(e => e.id.startsWith('r')).map(e => [e.id, e.embedding])
-  );
-
-  /* Para cada bloque del referente, encontrar similitud máxima con cualquier bloque del guion */
-  const missingInScript = [];
-  for (let j = 0; j < refBlocks.length; j++) {
-    let maxSim = 0;
-    for (let i = 0; i < scriptBlocks.length; i++) {
-      const s = dot(sMap['s' + i], rMap['r' + j]);
-      if (s > maxSim) maxSim = s;
-    }
-    if (maxSim < threshold) {
-      missingInScript.push({ refBlockIndex: j, text: refBlocks[j], maxSimilarity: maxSim });
-    }
-  }
-
-  /* Viceversa: bloques del guion sin correspondencia en referente */
-  const uniqueToScript = [];
-  for (let i = 0; i < scriptBlocks.length; i++) {
-    let maxSim = 0;
-    for (let j = 0; j < refBlocks.length; j++) {
-      const s = dot(sMap['s' + i], rMap['r' + j]);
-      if (s > maxSim) maxSim = s;
-    }
-    if (maxSim < threshold) {
-      uniqueToScript.push({ scriptBlockIndex: i, text: scriptBlocks[i], maxSimilarity: maxSim });
-    }
-  }
-
-  return {
-    type: 'REF_GAPS_RESULT',
-    requestId: data.requestId,
-    missingInScript: missingInScript.sort((a, b) => a.maxSimilarity - b.maxSimilarity),
-    uniqueToScript: uniqueToScript.sort((a, b) => a.maxSimilarity - b.maxSimilarity),
-    totalRefBlocks: refBlocks.length,
-    totalScriptBlocks: scriptBlocks.length
-  };
-}
-
-/* ---------- dispatcher principal ---------- */
+/* ============================================================
+   Router de mensajes
+   ============================================================ */
 self.onmessage = async ({ data }) => {
   try {
-    if (data.type === 'INIT') {
-      mode = data.mode || 'basic';
-      if (mode === 'embeddings') {
-        postMessage({ type: 'PROGRESS', message: 'Cargando motor IA local\u2026' });
-        await loadExtractor();
-      }
-      postMessage({ type: 'READY', mode });
-      return;
-    }
-
-    /* Todas las operaciones de embeddings requieren modo embeddings */
-    if (mode !== 'embeddings') {
-      postMessage({ type: 'ERROR', requestId: data.requestId, message: 'Modo embeddings no activo. Activá el modo AI primero.' });
-      return;
-    }
-
-    let result;
     switch (data.type) {
+      case 'INIT':
+        await init(data.revision);
+        break;
       case 'EMBED':
-        result = await handleEmbed(data);
+        await embed(data);
         break;
       case 'EXTRACT_KEY_SENTENCES':
-        result = await handleExtractKeySentences(data);
+        await extractKeySentences(data);
         break;
       case 'COMPUTE_REDUNDANCY':
-        result = await handleRedundancy(data);
+        await computeRedundancy(data);
         break;
       case 'COMPUTE_DENSITY':
-        result = await handleDensity(data);
-        break;
-      case 'COMPARE_SCRIPTS':
-        result = await handleCompare(data);
+        await computeDensity(data);
         break;
       case 'DETECT_GAPS':
-        result = await handleGaps(data);
-        break;
-      case 'EMBED_TEXTS':
-        result = await handleEmbedTexts(data);
-        break;
-      case 'COMPUTE_REF_GAPS':
-        result = await handleRefGaps(data);
+        await detectGaps(data);
         break;
       default:
-        postMessage({ type: 'ERROR', requestId: data.requestId, message: 'Tipo de mensaje desconocido: ' + data.type });
-        return;
+        self.postMessage({ type: 'ERROR', requestId: data.requestId, message: 'Tipo desconocido: ' + data.type });
     }
-    postMessage(result);
   } catch (error) {
-    postMessage({ type: 'ERROR', requestId: data.requestId, message: error.message || 'Error desconocido en worker' });
+    self.postMessage({ type: 'ERROR', requestId: data.requestId, message: error.message || 'Error en ai-worker' });
   }
 };
